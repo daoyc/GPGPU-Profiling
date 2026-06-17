@@ -10,162 +10,74 @@
 
 1. [模块层级架构](#1-模块层级架构)
 2. [五段流水线](#2-五段流水线)
-3. [数据流图](#3-数据流图)
+3. [指令与数据流](#3-指令与数据流)
 4. [存储层次](#4-存储层次)
 5. [SFU 内部结构](#5-sfu-内部结构)
 6. [单周期执行顺序](#6-单周期执行顺序)
-7. [关键参数默认值](#7-关键参数默认值)
-8. [文件与模块映射表](#8-文件与模块映射表)
-9. [常见配置修改方法](#9-常见配置修改方法)
+7. [核心数据结构: instr_trace_t](#7-核心数据结构-instr_trace_t)
+8. [关键参数默认值](#8-关键参数默认值)
+9. [文件与模块映射表](#9-文件与模块映射表)
+10. [常见配置修改方法](#10-常见配置修改方法)
 
 ---
 
 ## 1. 模块层级架构
 
-```mermaid
-graph TD
-    subgraph Processor
-        ProcessorImpl["ProcessorImpl"]
-        Kmu["Kmu (Grid Walker)"]
-        Memory["Memory (DRAM timing)"]
-        L3["L3 Cache (2MB)"]
-    end
+![模块层级架构](hierarchy.png)
 
-    subgraph Cluster["Cluster[VX_CFG_NUM_CLUSTERS]"]
-        L2["L2 Cache (1MB)"]
-        DxaCore["DxaCore (DMA)"]
-        TexCore["TexCore + TCache"]
-        OmCore["OmCore + OCache"]
-        RasterCore["RasterCore + RCache"]
-
-        subgraph Socket["Socket[NUM_SOCKETS]"]
-            L1I["L1 I$ (16KB, 4-way)"]
-            L1D["L1 D$ (16KB, 4-way)"]
-
-            subgraph Core["Core[VX_CFG_SOCKET_SIZE]"]
-                Scheduler["Scheduler<br/>(warp scheduler + CtaDispatcher + BarrierUnit)"]
-                Decompressor["Decompressor (RVC)"]
-                Decoder["Decoder"]
-                Scoreboard["Scoreboard"]
-                Sequencer["Sequencer[VX_CFG_NUM_WARPS]<br/>(macro→micro-op)"]
-                Operands["Operands[ISSUE_WIDTH]<br/>(register read)"]
-                Dispatcher["Dispatcher[FUType]"]
-                ALU["AluUnit"]
-                FPU["FpuUnit"]
-                LSU["LsuUnit"]
-                SFU["SfuUnit"]
-                TCU["TcuUnit"]
-                LocalMem["LocalMem (per-core SRAM, 16KB)"]
-                LocalMemSwitch["LocalMemSwitch"]
-                MemCoalescer["MemCoalescer"]
-                LsuMemAdapter["LsuMemAdapter"]
-                MMU["MMU (optional)"]
-            end
-        end
-    end
-
-    ProcessorImpl --> Kmu
-    ProcessorImpl --> Memory
-    ProcessorImpl --> L3
-    L3 --> Cluster
-    Cluster --> L2
-    L2 --> Socket
-    Socket --> L1I
-    Socket --> L1D
-    Socket --> Core
 ```
+Processor (顶层 Facade)
+ └── ProcessorImpl
+      ├── Kmu   (Grid Walker)
+      ├── Memory  (DRAM timing)
+      ├── L3 Cache  (2MB, 8-way)
+      └── Cluster[NUM_CLUSTERS]
+           ├── L2 Cache  (1MB, 8-way)
+           ├── DxaCore / TexCore / OmCore / RasterCore (图形/DMA 后端)
+           └── Socket[NUM_SOCKETS]
+                └── Core[SOCKET_SIZE]
+                     ├── Scheduler  (warp pick + BarrierUnit + CtaDispatcher)
+                     ├── Decompressor (RVC) → Decoder → Scoreboard
+                     ├── Sequencer[per warp] (macro→micro-op split)
+                     ├── Operands[ISSUE_WIDTH] (regfile read)
+                     ├── Dispatcher[FUType]  (issue width→narrow blocks)
+                     ├── ALU | FPU | LSU | SFU | TCU
+                     ├── MemCoalescer → LocalMemSwitch → LocalMem | L1D$
+                     ├── LsuMemAdapter → MMU (optional)
+                     └── Commit Arbiter → Writeback
+```
+
+---
 
 ## 2. 五段流水线
 
-```mermaid
-graph LR
-    subgraph Schedule
-        S["❖ Schedule<br/>pick warp"]
-    end
-    subgraph Fetch
-        F["❖ Fetch<br/>I$ request"]
-    end
-    subgraph Decode
-        D["❖ Decode<br/>instr → Instr"]
-    end
-    subgraph Issue
-        I["❖ Issue<br/>scoreboard + sequencer + operands"]
-    end
-    subgraph Execute
-        E["❖ Execute<br/>FU dispatch + exec"]
-    end
-    subgraph Commit
-        C["❖ Commit<br/>wb + scoreboard release"]
-    end
+![五段流水线](pipeline.png)
 
-    S --> F --> D --> I --> E --> C
-    C -.->|resume warp| S
-```
+| 阶段 | 对应代码 | 功能 |
+|------|----------|------|
+| **Schedule** | `scheduler.cpp` | 从活跃 warp 中挑选就绪 warp, 推入 fetch_latch |
+| **Fetch** | `core.cpp:fetch()` + `decompressor.cpp` | 发出 I$ 请求, 处理 RVC 压缩指令 |
+| **Decode** | `decode.cpp` | 译码为 `Instr` 对象, 推入 per-warp ibuffer |
+| **Issue** | `core.cpp:issue()` + `scoreboard.cpp` + `sequencer.cpp` + `operands.cpp` | 冒险检查 → macro→micro 分解 → 读寄存器 → 路由分发 |
+| **Execute**| `dispatcher.cpp` + `alu/fpu/lsu/sfu/tcu_unit.cpp` | FU 执行, 产 dst_data |
+| **Commit** | `core.cpp:commit()` + `operands.cpp:wb` | 写回 regfile, 释放 scoreboard |
 
-### 反向流水线原理
+### 反向流水线
 
-Core 的 `tick()` 按 **逆序** 调用各阶段：
+Core 的 `tick()` 按 **逆序** (commit → execute → issue → decode → fetch → schedule) 调用各阶段:
 
-```mermaid
-graph TD
-    tick["Core::Impl::tick()"] --> commit["1️⃣ commit()<br/>FU 结果写回"]
-    commit --> execute["2️⃣ execute()<br/>FU 派发执行"]
-    execute --> issue["3️⃣ issue()<br/>ibuffer → scoreboard → operands → dispatcher"]
-    issue --> decode["4️⃣ decode()<br/>decoder → ibuffer"]
-    decode --> fetch["5️⃣ fetch()<br/>icache request"]
-    fetch --> schedule["6️⃣ schedule()<br/>pick next warp → fetch_latch_"]
+- **commit 最先执行**: FU 结果本周期即可被 issue 的 RAW 检查看见
+- 若正向执行则 commit 的结果隔一周期才可见, 浪费 1 个时钟周期
 
-    style tick fill:#f55,color:#fff,stroke:#333
-    style commit fill:#5a5,color:#fff
-    style execute fill:#5a5,color:#fff
-    style issue fill:#5a5,color:#fff
-    style decode fill:#5a5,color:#fff
-    style fetch fill:#5a5,color:#fff
-    style schedule fill:#5a5,color:#fff
-```
+---
 
-**为什么逆序**: commit 最先执行, 写回结果当前周期即可被 issue 的 RAW 检查看见, 避免浪费一个时钟周期。
+## 3. 指令与数据流
 
-## 3. 数据流图
+![数据流](dataflow.png)
 
-### 指令流 (instr_trace_t 贯穿全程)
+在 simx 中, 每条指令的状态贯穿全程并逐阶段填充 `instr_trace_t` 结构体.
 
-```mermaid
-graph TD
-    Scheduler -->|pick warp| Fetch
-    Fetch -->|raw code| Decompressor
-    Decompressor -->|decompressed code| Decoder
-    Decoder -->|Instr| Ibuffer["Ibuffer[]"]
-    Ibuffer --> Scoreboard["Scoreboard<br/>(RAW/WAW check)"]
-    Scoreboard -->|pass| Sequencer["Sequencer<br/>(macro→micro-op)"]
-    Sequencer --> Operands["Operands<br/>(regfile read)"]
-    Operands --> Dispatcher["Dispatcher<br/>(IW→NB)"]
-
-    Dispatcher --> ALU
-    Dispatcher --> FPU
-    Dispatcher --> LSU
-    Dispatcher --> SFU
-    Dispatcher --> TCU
-
-    LSU --> MemCoalescer
-    MemCoalescer --> LocalMemSwitch["LocalMemSwitch"]
-    LocalMemSwitch --> LocalMem["LocalMem (SRAM)"]
-    LocalMemSwitch --> L1D["L1 D$"]
-    L1D --> L2["L2 Cache"]
-    L2 --> L3["L3 Cache"]
-    L3 --> DRAM["DRAM"]
-
-    ALU --> CommitArbiter["Commit Arbiter"]
-    FPU --> CommitArbiter
-    LSU --> CommitArbiter
-    SFU --> CommitArbiter
-    TCU --> CommitArbiter
-
-    CommitArbiter -->|writeback| Writeback["Writeback<br/>(regfile + scoreboard)"]
-    Writeback -.->|resume warp| Scheduler
-```
-
-### 核心数据结构: `instr_trace_t`
+### 7. 核心数据结构: `instr_trace_t`
 
 | 字段 | 填充阶段 | 用途 |
 |------|----------|------|
@@ -180,142 +92,74 @@ graph TD
 | `dst_data` | Execute | 执行结果 |
 | `wb` | Decode | 是否需要写回 |
 
+---
+
 ## 4. 存储层次
 
-```mermaid
-graph TD
-    subgraph Core["Per Core"]
-        LSU_Unit["LSU Unit<br/>(地址计算 + 发射)"]
-        MemCoalescer["MemCoalescer<br/>(32 threads → Cache Line aligned)"]
-        LocalMemSwitch["LocalMemSwitch<br/>(地址区间路由)"]
-        LocalMem["LocalMem SRAM<br/>(16KB, per-core)"]
-        L1D["L1 D$ (16KB, 4-way, 64B line)"]
-    end
+![存储层次](memory_hierarchy.png)
 
-    subgraph Cluster["Per Cluster"]
-        L2["L2 Cache<br/>(1MB, 8-way, 64B line)"]
-    end
+### 三级缓存 + 共享内存
 
-    subgraph Global["Global"]
-        L3["L3 Cache<br/>(2MB, 8-way, 64B line)"]
-        DRAM["DRAM<br/>(DDR3/DDR4/LPDDR5/HBM)"]
-    end
+| 层次 | 容量 | 关联度 | Cache Line |
+|------|------|--------|------------|
+| LocalMem (SRAM) | 16 KB | — (直接寻址) | — |
+| L1 D$ | 16 KB | 4-way | 64 B |
+| L2 Cache | 1 MB | 8-way | 64 B |
+| L3 Cache | 2 MB | 8-way | 64 B |
+| DRAM | — | DDR3/4/LPDDR5/HBM 时序模型 | — |
 
-    LSU_Unit --> MemCoalescer
-    MemCoalescer --> LocalMemSwitch
-    LocalMemSwitch --> LocalMem
-    LocalMemSwitch --> L1D
-    L1D --> L2
-    L2 --> L3
-    L3 --> DRAM
-```
+### 访存合并 (MemCoalescer)
 
-### 访存合并 (MemCoalescer) 原理
+见 `mem/mem_coalescer.cpp`, 核心流程:
 
-```mermaid
-graph LR
-    subgraph Input["32 threads scatter addresses"]
-        A0["addr[0]: 0x1000"]
-        A1["addr[1]: 0x1004"]
-        A2["addr[2]: 0x1008"]
-        A3["addr[3]: 0x100C"]
-        A4["addr[4]: 0x1100"]
-    end
+1. 接收 **32 线程散列地址** (`input_size = 32`)
+2. 每个地址按 `addr & ~(line_size-1)` 对齐到 Cache Line
+3. 同一 Cache Line 内的请求**合并**为一个 (`output_size ≤ 32`)
+4. **完美合并**: 32 个连续对齐地址 → 1 个请求 (128B, 跨 2 条 64B Cache Line)
+5. **最差情况**: 32 个完全随机地址 → 32 个独立请求
+6. AMO 原子操作**跳过合并** (RISC-V RVA 不保证合并安全性)
 
-    subgraph Align["addr & ~(line_size-1)"]
-        L0["line: 0x1000"]
-        L1["line: 0x1000"]
-        L2["line: 0x1000"]
-        L3["line: 0x1000"]
-        L4["line: 0x1100"]
-    end
-
-    subgraph Merge["merge same line"]
-        R1["req[0]: line 0x1000<br/>(thread 0-3, 16B)"]
-        R2["req[1]: line 0x1100<br/>(thread 4, 4B)"]
-    end
-
-    A0 --> L0
-    A1 --> L1
-    A2 --> L2
-    A3 --> L3
-    A4 --> L4
-    L0 --> R1
-    L1 --> R1
-    L2 --> R1
-    L3 --> R1
-    L4 --> R2
-```
-
-- **完美合并**: 32 个连续对齐地址 → 1 个请求 (32×4B=128B, 跨 2 条 64B Cache Line)
-- **最差情况**: 32 个完全随机地址 → 32 个请求, 无合并
-- AMO 原子操作跳过合并 (RISC-V RVA 不保证合并安全)
+---
 
 ## 5. SFU 内部结构
 
-```mermaid
-graph TD
-    subgraph SFU["SFU (Special Function Unit)"]
-        SFU_Inputs["SFU Inputs[b]"]
-        Wctl["WctlUnit<br/>TMC / WSPAWN / SPLIT<br/>JOIN / BAR / PRED / WSYNC"]
-        Csr["CsrUnit<br/>CSRRW / CSRRS / CSRRC"]
-        Dxa["DxaUnit<br/>DMA issue"]
-        Tex["TexUnit<br/>Texture sample"]
-        Om["OmUnit<br/>OIT merge"]
-        Raster["RasterUnit<br/>Rasterization pop"]
+![SFU 内部结构](fu_inside.png)
 
-        SFU_Inputs --> Wctl
-        SFU_Inputs --> Csr
-        SFU_Inputs --> Dxa
-        SFU_Inputs --> Tex
-        SFU_Inputs --> Om
-        SFU_Inputs --> Raster
-    end
+SFU (Special Function Unit) 包含 6 个子单元, 按操作类型路由:
 
-    subgraph Cluster["Per Cluster Backend"]
-        DxaCore["DxaCore<br/>(DMA Engine)"]
-        TexCore["TexCore + TCache"]
-        OmCore["OmCore + OCache"]
-        RasterCore["RasterCore + RCache"]
-    end
+| 子单元 | 操作 | 延迟模型 |
+|--------|------|----------|
+| **WctlUnit** | TMC / WSPAWN / SPLIT / JOIN / BAR / PRED / WSYNC | 立即完成 |
+| **CsrUnit** | CSRRW / CSRRS / CSRRC | 立即完成 |
+| **DxaUnit** | DMA issue | fire-and-forget → DxaCore |
+| **TexUnit** | 纹理采样 | fire-and-wait → TexCore |
+| **OmUnit** | OIT 合并 | fire-and-forget → OmCore |
+| **RasterUnit**| 光栅化弹出 | fire-and-wait → RasterCore |
 
-    Wctl -->|"立即完成"| Commit
-    Csr -->|"立即完成"| Commit
-    Dxa -->|"fire-and-forget"| DxaCore
-    Tex -->|"fire-and-wait"| TexCore
-    Om -->|"fire-and-forget"| OmCore
-    Raster -->|"fire-and-wait"| RasterCore
-
-    DxaCore --> Commit
-    TexCore --> Commit
-    OmCore --> Commit
-    RasterCore --> Commit
-```
+---
 
 ## 6. 单周期执行顺序
 
-```mermaid
-sequenceDiagram
-    participant Core as Core::Impl
-    participant Commit as commit()
-    participant Exec as execute()
-    participant Issue as issue()
-    participant Decode as decode()
-    participant Fetch as fetch()
-    participant Sched as schedule()
+![单周期执行顺序](tick_cycle.png)
 
-    Core->>Commit: 1️⃣ FU 结果写回 regfile + scoreboard
-    Core->>Exec: 2️⃣ 各 FU 执行
-    Core->>Issue: 3️⃣ ibuffer → scoreboard → operands → dispatcher
-    Core->>Decode: 4️⃣ decoder → ibuffer
-    Core->>Fetch: 5️⃣ icache 请求
-    Core->>Sched: 6️⃣ 挑选下一个 warp → fetch_latch_
-    Sched-->>Core: next cycle
+```
+Core::Impl::tick()
+  │
+  1️⃣  commit()    — FU 结果写回 regfile, 释放 scoreboard
+  2️⃣  execute()   — 各 FU 执行, 产 dst_data
+  3️⃣  issue()     — ibuffer → scoreboard → sequencer → operands → dispatcher
+  4️⃣  decode()    — raw code → Instr 对象 → 推入 ibuffer
+  5️⃣  fetch()     — 发出 icache 请求
+  6️⃣  schedule()  — 挑选下一个 warp → fetch_latch_
+  │
+  └── next cycle
 ```
 
-## 7. 关键参数默认值
+---
 
-> 配置源: `VX_config.toml` + `VX_types.toml` (仓库根目录)
+## 8. 关键参数默认值
+
+> 配置源: `VX_config.toml` + `VX_types.toml`
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -323,9 +167,9 @@ sequenceDiagram
 | `VX_CFG_NUM_CORES` | 1 | 总核心数 |
 | `VX_CFG_SOCKET_SIZE` | 1 | 每 Socket 核心数 |
 | `VX_CFG_NUM_WARPS` | 4 | 每 Core Warp 数 |
-| `VX_CFG_NUM_THREADS` | 4 | 每 Warp 线程数 |
+| `VX_CFG_NUM_THREADS` | 4 | 每 Warp 线程数 (= CUDA warp size) |
 | `VX_CFG_NUM_BARRIERS` | 8 | Barrier slots |
-| `VX_CFG_ISSUE_WIDTH` | 1 | 发射宽度 |
+| `VX_CFG_ISSUE_WIDTH` | 1 | 发射宽度 (标量) |
 | `VX_CFG_IBUF_SIZE` | 4 | 每 Warp 指令缓冲深度 |
 | `VX_CFG_NUM_ALU_BLOCKS` | 1 | ALU 块数 |
 | `VX_CFG_NUM_FPU_BLOCKS` | 1 | FPU 块数 |
@@ -336,7 +180,7 @@ sequenceDiagram
 | `VX_CFG_L2_CACHE_SIZE` | 1048576 (1MB) | L2 Cache |
 | `VX_CFG_L3_CACHE_SIZE` | 2097152 (2MB) | L3 Cache |
 | `VX_CFG_LMEM_LOG_SIZE` | 14 (16KB) | 共享内存 |
-| `VX_CFG_MEM_BLOCK_SIZE` | 64 | Cache Line / 传输块大小 |
+| `VX_CFG_MEM_BLOCK_SIZE` | 64 | Cache Line 大小 |
 
 ### 默认配置总线程数
 
@@ -344,7 +188,9 @@ sequenceDiagram
 1 cluster × 1 socket × 1 core × 4 warps × 4 threads = 16 threads
 ```
 
-## 8. 文件与模块映射表
+---
+
+## 9. 文件与模块映射表
 
 | 文件路径 (相对 `sim/simx/`) | 模块 | 流水阶段 |
 |-----------------------------|------|----------|
@@ -369,7 +215,7 @@ sequenceDiagram
 | `mem/memory.cpp` | DRAM 时序模型 | Memory |
 | `mem/lsu_mem_adapter.cpp` | LSU↔存储适配 | Memory |
 | `mem/local_mem_switch.cpp` | LMEM 地址路由 | Memory |
-| `mem/mmu.cpp` | 虚拟地址翻译 | Memory |
+| `mem/mmu.cpp` | 虚拟地址翻译 (MMU) | Memory |
 | `barrier_unit.cpp` | Warp 同步栅栏 | Scheduler 子级 |
 | `cta_dispatcher.cpp` | CTA 调度 | Scheduler 子级 |
 | `kmu/kmu.cpp` | Kernel Management Unit | Processor 级 |
@@ -381,21 +227,22 @@ sequenceDiagram
 | `cluster.cpp` | Cluster 顶层 | — |
 | `processor_impl.h` | Processor 顶层 | — |
 | `main.cpp` | 模拟入口 | — |
-| `sim/common/simobject.h` | 仿真框架 (SimObject/SimChannel/SimPlatform) | 基础设施 |
+| `sim/common/simobject.h` | 仿真框架基类 | 基础设施 |
 
-## 9. 常见配置修改方法
+---
 
-### 通过环境变量 (运行时临时修改)
+## 10. 常见配置修改方法
+
+### 运行时 (环境变量)
 
 ```bash
-# 修改 Warp/Thread 数, 开启 L2 Cache
 CONFIGS="-DVX_CFG_NUM_WARPS=8 -DVX_CFG_NUM_THREADS=16 -DVX_CFG_L2_ENABLE" \
 ./ci/blackbox.sh --driver=simx --app=demo
 ```
 
-### 通过 VX_config.toml (永久修改)
+### 永久 (VX_config.toml)
 
-编辑仓库根目录的 `VX_config.toml`, 然后重新构建:
+编辑仓库根目录 `VX_config.toml`, 然后重建:
 
 ```bash
 cd build
